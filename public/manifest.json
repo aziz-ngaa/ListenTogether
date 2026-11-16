@@ -1,0 +1,18 @@
+{
+  "name": "ListenTogether",
+  "short_name": "ListenTogether",
+  "description": "Stream YouTube Music in real-time sync with friends and live chat.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f0f0f",
+  "theme_color": "#ff0033",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
