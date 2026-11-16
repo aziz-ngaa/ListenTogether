@@ -1,598 +1,291 @@
 const express = require('express');
 const http = require('http');
-const path = require('path');
-const { spawn } = require('child_process');
-const { Readable } = require('stream');
-const crypto = require('crypto');
-const cors = require('cors');
-const yts = require('yt-search');
 const { Server } = require('socket.io');
-
-const PORT = process.env.PORT || 3000;
-const HEARTBEAT_INTERVAL_MS = 5000;
-
-const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.tokhmi.xyz',
-  'https://pipedapi.moomoo.me',
-  'https://piped-api.garudalinux.org'
-];
-
-const INVIDIOUS_INSTANCES = [
-  'https://inv.nadeko.net',
-  'https://invidious.nerdvpn.de',
-  'https://yt.artemislena.eu',
-  'https://invidious.privacyredirect.com'
-];
+const { Innertube, UniversalCache } = require('youtubei.js');
+const { spawn } = require('child_process');
+const path = require('path');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+const server = http.createServer(app);
+const io = new Server(server);
+
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Serve an inline SVG icon for PWA installability without external assets
-app.get('/icon.svg', (req, res) => {
-  res.setHeader('Content-Type', 'image/svg+xml');
-  res.setHeader('Cache-Control', 'public, max-age=86400');
-  res.send(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-    <rect width="512" height="512" rx="112" fill="#0f0f0f"/>
-    <circle cx="256" cy="256" r="180" fill="#ff0033"/>
-    <polygon points="212,172 348,256 212,340" fill="#ffffff"/>
-  </svg>`);
-});
-
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
+let yt = null;
+async function initInnerTube() {
+  try {
+    yt = await Innertube.create({
+      cache: new UniversalCache(false),
+      generate_session_locally: true
+    });
+    console.log('InnerTube (YT Music) initialized');
+  } catch (e) {
+    console.error('InnerTube init failed:', e.message);
   }
-});
-
-/**
- * In-memory room store.
- * Key: roomCode (uppercase string)
- */
-const rooms = new Map();
-
-function sanitizeRoomCode(code) {
-  return String(code || '')
-    .trim()
-    .toUpperCase()
-    .replace(/[^A-Z0-9_-]/g, '')
-    .slice(0, 24);
 }
+initInnerTube();
 
-function sanitizeDisplayName(name) {
-  const cleaned = String(name || '').trim().slice(0, 30);
-  return cleaned || 'Listener';
-}
+const rooms = {};
 
-function isValidVideoId(id) {
-  return typeof id === 'string' && /^[a-zA-Z0-9_-]{11}$/.test(id);
-}
-
-function getOrCreateRoom(roomCode) {
-  if (!rooms.has(roomCode)) {
-    rooms.set(roomCode, {
-      id: roomCode,
+function getOrCreateRoom(roomId) {
+  if (!rooms[roomId]) {
+    rooms[roomId] = {
       currentTrack: null,
       queue: [],
       isPlaying: false,
       position: 0,
       lastUpdated: Date.now(),
-      users: new Map(),
+      users: {},
       messages: []
-    });
+    };
   }
-  return rooms.get(roomCode);
+  return rooms[roomId];
 }
 
-function getLivePosition(room) {
-  if (!room.currentTrack) return 0;
-  let pos = room.position;
-  if (room.isPlaying) {
-    pos += (Date.now() - room.lastUpdated) / 1000;
-  }
-  if (room.currentTrack.seconds && room.currentTrack.seconds > 0) {
-    pos = Math.min(pos, room.currentTrack.seconds);
-  }
-  return Math.max(0, pos);
+function getExactPosition(room) {
+  if (!room.isPlaying) return room.position;
+  return room.position + (Date.now() - room.lastUpdated) / 1000;
 }
 
-function buildTrackPayload(track) {
-  return {
-    instanceId: track.instanceId || crypto.randomUUID(),
-    videoId: track.videoId,
-    title: String(track.title || 'Unknown Title').slice(0, 200),
-    artist: String(track.artist || 'Unknown Artist').slice(0, 120),
-    duration: String(track.duration || '0:00').slice(0, 20),
-    seconds: Number(track.seconds) || 0,
-    thumbnail: String(track.thumbnail || '')
-  };
-}
-
-function serializeRoomState(room) {
-  return {
-    roomId: room.id,
-    currentTrack: room.currentTrack,
-    queue: room.queue,
-    isPlaying: room.isPlaying,
-    position: getLivePosition(room),
-    serverTime: Date.now(),
-    users: Array.from(room.users.values()),
-    messages: room.messages
-  };
-}
-
-function advanceQueue(room) {
-  if (room.queue.length > 0) {
-    const next = room.queue.shift();
-    room.currentTrack = buildTrackPayload(next);
-    room.isPlaying = true;
-    room.position = 0;
-    room.lastUpdated = Date.now();
-  } else {
-    room.currentTrack = null;
-    room.isPlaying = false;
-    room.position = 0;
-    room.lastUpdated = Date.now();
-  }
-  io.to(room.id).emit('room-state', serializeRoomState(room));
-}
-
-// YouTube Music Search Endpoint
-app.get('/api/search', async (req, res) => {
-  const q = String(req.query.q || '').trim();
-  if (!q) {
-    return res.status(400).json({ error: 'Missing query parameter q' });
-  }
-
+// 1. Live Search Suggestions (As you type, just like YT Music)
+app.get('/api/suggestions', async (req, res) => {
+  const q = req.query.q;
+  if (!q) return res.json([]);
   try {
-    const searchQuery = q.toLowerCase().includes('music') || q.toLowerCase().includes('audio')
-      ? q
-      : `${q} audio`;
-    const result = await yts(searchQuery);
-    const videos = (result.videos || [])
-      .filter((v) => isValidVideoId(v.videoId) && v.seconds > 0)
-      .slice(0, 20)
-      .map((v) => ({
-        videoId: v.videoId,
-        title: v.title,
-        artist: (v.author && v.author.name) || 'Unknown Artist',
-        duration: v.timestamp || '0:00',
-        seconds: v.seconds || 0,
-        thumbnail: v.thumbnail || v.image || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`
-      }));
-
-    res.json({ results: videos });
+    if (yt) {
+      const suggestions = await yt.music.getSearchSuggestions(q);
+      const list = [];
+      for (const section of suggestions) {
+        if (section.contents) {
+          for (const item of section.contents) {
+            if (item.suggestion?.text) list.push(item.suggestion.text);
+          }
+        }
+      }
+      if (list.length > 0) return res.json(list.slice(0, 8));
+    }
+    // Fallback to Google/YouTube autocomplete endpoint
+    const resp = await fetch(`https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=${encodeURIComponent(q)}`);
+    const data = await resp.json();
+    res.json((data[1] || []).slice(0, 8));
   } catch (err) {
-    console.error('[Search Error]', err.message);
-    res.status(500).json({ error: 'Failed to search YouTube Music catalog' });
+    res.json([]);
   }
 });
 
-async function fetchFallbackAudioUrl(videoId, externalSignal) {
-  // Try Piped public instances first
-  for (const baseUrl of PIPED_INSTANCES) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4500);
-    const onExternalAbort = () => controller.abort();
-    if (externalSignal) externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+// 2. YouTube Music Catalog Search (Songs & Videos)
+app.get('/api/search', async (req, res) => {
+  const query = req.query.q;
+  if (!query) return res.json([]);
+  try {
+    if (!yt) await initInnerTube();
+    const search = await yt.music.search(query, { type: 'song' });
+    let items = search.results || [];
 
-    try {
-      const resp = await fetch(`${baseUrl}/streams/${videoId}`, {
-        signal: controller.signal,
-        headers: { 'User-Agent': 'ListenTogether/1.0' }
-      });
-      if (!resp.ok) continue;
-      const data = await resp.json();
-      const audioStreams = (data.audioStreams || []).filter((s) => s.url);
-      if (audioStreams.length === 0) continue;
-
-      const mp4Streams = audioStreams.filter((s) =>
-        (s.mimeType && s.mimeType.includes('audio/mp4')) || s.format === 'M4A'
-      );
-      const pool = mp4Streams.length > 0 ? mp4Streams : audioStreams;
-      pool.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-      return {
-        url: pool[0].url,
-        contentType: pool[0].mimeType ? pool[0].mimeType.split(';')[0] : 'audio/mp4'
-      };
-    } catch (_) {
-      // Try next instance
-    } finally {
-      clearTimeout(timeout);
-      if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
+    // Fallback to general search if song-only shelf is empty
+    if (items.length === 0) {
+      const gen = await yt.search(query);
+      items = gen.videos || [];
     }
+
+    const tracks = items.slice(0, 20).map(item => {
+      const id = item.id || item.video_id;
+      const title = item.title?.text || item.title || 'Unknown Title';
+      const artist = item.artists?.map(a => a.name).join(', ') || item.author?.name || 'YouTube Music';
+      const duration = item.duration?.text || '';
+      const thumbs = item.thumbnail?.contents || item.thumbnails || [];
+      const thumbnail = thumbs[0]?.url || `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+      return { id, title, author: artist, duration, thumbnail };
+    }).filter(t => t.id);
+
+    res.json(tracks);
+  } catch (err) {
+    console.error('Search error:', err.message);
+    res.status(500).json({ error: 'Search failed' });
   }
+});
 
-  // Try Invidious public instances as secondary fallback
-  for (const baseUrl of INVIDIOUS_INSTANCES) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4500);
-    const onExternalAbort = () => controller.abort();
-    if (externalSignal) externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+// 3. Fetch Lyrics from YT Music
+app.get('/api/lyrics/:videoId', async (req, res) => {
+  try {
+    if (!yt) await initInnerTube();
+    const info = await yt.music.getLyrics(req.params.videoId);
+    res.json({ lyrics: info?.description?.text || 'No lyrics available for this track.' });
+  } catch (e) {
+    res.json({ lyrics: 'Lyrics unavailable for this track.' });
+  }
+});
 
+// 4. Multi-Fallback Audio Streamer (Bypasses Render Datacenter Blocks)
+const PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.tokhmi.xyz',
+  'https://pipedapi.syncpundit.io',
+  'https://api.piped.projectsegfau.lt'
+];
+
+async function getPipedAudioUrl(videoId) {
+  for (const base of PIPED_INSTANCES) {
     try {
-      const resp = await fetch(`${baseUrl}/api/v1/videos/${videoId}`, {
-        signal: controller.signal,
-        headers: { 'User-Agent': 'ListenTogether/1.0' }
-      });
-      if (!resp.ok) continue;
-      const data = await resp.json();
-      const formats = (data.adaptiveFormats || []).filter(
-        (f) => f.type && f.type.startsWith('audio/') && f.url
-      );
-      if (formats.length === 0) continue;
-
-      const mp4Formats = formats.filter((f) => f.type.includes('audio/mp4'));
-      const pool = mp4Formats.length > 0 ? mp4Formats : formats;
-      pool.sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0));
-      return {
-        url: pool[0].url,
-        contentType: pool[0].type.split(';')[0]
-      };
-    } catch (_) {
-      // Try next instance
-    } finally {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4000);
+      const res = await fetch(`${base}/streams/${videoId}`, { signal: controller.signal });
       clearTimeout(timeout);
-      if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
-    }
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (data.audioStreams && data.audioStreams.length > 0) {
+        // Prefer m4a for iOS Safari compatibility
+        const m4a = data.audioStreams.find(s => s.mimeType?.includes('mp4') || s.format === 'M4A');
+        return (m4a || data.audioStreams[0]).url;
+      }
+    } catch (_) {}
   }
-
   return null;
 }
 
-async function streamFromFallback(videoId, req, res) {
-  const abortController = new AbortController();
-  const onClose = () => abortController.abort();
-  req.on('close', onClose);
-
-  try {
-    const resolved = await fetchFallbackAudioUrl(videoId, abortController.signal);
-    if (!resolved) {
-      if (!res.headersSent) {
-        res.status(502).json({ error: 'All stream sources failed' });
-      }
-      return;
-    }
-
-    const upstreamHeaders = {
-      'User-Agent': 'Mozilla/5.0 (compatible; ListenTogether/1.0)'
-    };
-    if (req.headers.range) {
-      upstreamHeaders.Range = req.headers.range;
-    }
-
-    const upstream = await fetch(resolved.url, {
-      headers: upstreamHeaders,
-      signal: abortController.signal
-    });
-
-    if (!upstream.ok && upstream.status !== 206) {
-      if (!res.headersSent) {
-        res.status(502).json({ error: 'Fallback stream returned an error' });
-      }
-      return;
-    }
-
-    res.status(upstream.status);
-    res.setHeader('Content-Type', resolved.contentType || 'audio/mp4');
-    res.setHeader('Cache-Control', 'no-store');
-    const contentLength = upstream.headers.get('content-length');
-    const contentRange = upstream.headers.get('content-range');
-    const acceptRanges = upstream.headers.get('accept-ranges');
-    if (contentLength) res.setHeader('Content-Length', contentLength);
-    if (contentRange) res.setHeader('Content-Range', contentRange);
-    if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges);
-
-    if (upstream.body) {
-      const nodeStream = Readable.fromWeb(upstream.body);
-      nodeStream.on('error', () => {
-        if (!res.writableEnded) res.end();
-      });
-      nodeStream.pipe(res);
-    } else {
-      res.end();
-    }
-  } catch (err) {
-    if (err.name !== 'AbortError' && !res.headersSent) {
-      res.status(500).json({ error: 'Fallback proxy error' });
-    }
-  } finally {
-    req.off('close', onClose);
-  }
-}
-
-// iOS & Android Audio Proxy Endpoint
-app.get('/api/stream/:videoId', (req, res) => {
+app.get('/api/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
-  if (!isValidVideoId(videoId)) {
-    return res.status(400).json({ error: 'Invalid YouTube videoId' });
+
+  // Strategy A: Try Piped API Audio Stream Proxy (Bypasses YT Datacenter IP Blocks)
+  const pipedUrl = await getPipedAudioUrl(videoId);
+  if (pipedUrl) {
+    try {
+      const headers = {};
+      if (req.headers.range) headers.Range = req.headers.range;
+      const upstream = await fetch(pipedUrl, { headers });
+
+      res.status(upstream.status);
+      res.setHeader('Content-Type', upstream.headers.get('content-type') || 'audio/mp4');
+      if (upstream.headers.get('content-length')) {
+        res.setHeader('Content-Length', upstream.headers.get('content-length'));
+      }
+      if (upstream.headers.get('content-range')) {
+        res.setHeader('Content-Range', upstream.headers.get('content-range'));
+      }
+      res.setHeader('Accept-Ranges', 'bytes');
+
+      const { Readable } = require('stream');
+      return Readable.fromWeb(upstream.body).pipe(res);
+    } catch (e) {
+      console.error('Piped proxy failed, falling back to yt-dlp:', e.message);
+    }
   }
 
-  const youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const ytdlp = spawn(
-    'yt-dlp',
-    ['-f', 'bestaudio[ext=m4a]/bestaudio', '-o', '-', '--no-playlist', '--no-warnings', youtubeUrl],
-    { stdio: ['ignore', 'pipe', 'pipe'] }
-  );
+  // Strategy B: Fallback to yt-dlp
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const ytdlp = spawn('yt-dlp', [
+    '-f', 'bestaudio[ext=m4a]/bestaudio',
+    '--extractor-args', 'youtube:player_client=android,web',
+    '-o', '-',
+    '--quiet',
+    url
+  ]);
 
-  let clientClosed = false;
-  let startedStreaming = false;
-  let fallbackTriggered = false;
-  let stderrBuffer = '';
+  res.setHeader('Content-Type', 'audio/mp4');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  ytdlp.stdout.pipe(res);
 
-  const cleanupProcess = () => {
-    if (!ytdlp.killed) {
-      ytdlp.kill('SIGKILL');
-    }
-  };
-
-  req.on('close', () => {
-    clientClosed = true;
-    cleanupProcess();
-  });
-
-  ytdlp.stderr.on('data', (chunk) => {
-    stderrBuffer += chunk.toString();
-    if (stderrBuffer.length > 4096) {
-      stderrBuffer = stderrBuffer.slice(-4096);
-    }
-  });
-
-  ytdlp.stdout.on('data', (chunk) => {
-    if (clientClosed || fallbackTriggered) return;
-
-    if (!startedStreaming) {
-      startedStreaming = true;
-      res.status(200);
-      res.setHeader('Content-Type', 'audio/mp4');
-      res.setHeader('Accept-Ranges', 'none');
-      res.setHeader('Cache-Control', 'no-store');
-    }
-    if (!res.write(chunk)) {
-      ytdlp.stdout.pause();
-      res.once('drain', () => {
-        if (!clientClosed && !ytdlp.killed) {
-          ytdlp.stdout.resume();
-        }
-      });
-    }
-  });
-
-  ytdlp.on('error', async (err) => {
-    console.error('[yt-dlp spawn error]', err.message);
-    if (!startedStreaming && !clientClosed && !fallbackTriggered) {
-      fallbackTriggered = true;
-      await streamFromFallback(videoId, req, res);
-    } else if (!res.writableEnded) {
-      res.end();
-    }
-  });
-
-  ytdlp.on('close', async (code) => {
-    if (clientClosed) return;
-
-    if (!startedStreaming && !fallbackTriggered) {
-      const isBotCheck = /bot|sign in|403|unavailable|confirm/i.test(stderrBuffer);
-      console.warn(`[yt-dlp exited ${code}] Bot check / stream failure for ${videoId}. Triggering fallback. Details: ${stderrBuffer.trim()}`);
-      fallbackTriggered = true;
-      if (isBotCheck || code !== 0) {
-        await streamFromFallback(videoId, req, res);
-      } else if (!res.headersSent) {
-        res.status(502).json({ error: 'Empty audio stream' });
-      }
-      return;
-    }
-
-    if (!res.writableEnded) {
-      res.end();
-    }
-  });
+  ytdlp.stderr.on('data', d => console.error('yt-dlp:', d.toString()));
+  req.on('close', () => ytdlp.kill());
 });
 
-// Socket.IO Real-Time Sync & Chat
+// 5. Real-Time Sync & Chat
 io.on('connection', (socket) => {
   let currentRoomId = null;
 
-  socket.on('join-room', ({ roomCode, displayName }) => {
-    const cleanRoom = sanitizeRoomCode(roomCode);
-    if (!cleanRoom) {
-      socket.emit('error-toast', { message: 'Please enter a valid room code.' });
-      return;
-    }
+  socket.on('join-room', ({ roomId, username }) => {
+    currentRoomId = roomId;
+    socket.join(roomId);
+    const room = getOrCreateRoom(roomId);
+    room.users[socket.id] = username || 'Guest';
 
-    // Leave any previous room
-    if (currentRoomId && rooms.has(currentRoomId)) {
-      const prevRoom = rooms.get(currentRoomId);
-      prevRoom.users.delete(socket.id);
-      socket.leave(currentRoomId);
-      io.to(currentRoomId).emit('users-updated', Array.from(prevRoom.users.values()));
-    }
+    socket.emit('room-state', {
+      currentTrack: room.currentTrack,
+      queue: room.queue,
+      isPlaying: room.isPlaying,
+      position: getExactPosition(room),
+      messages: room.messages,
+      users: Object.values(room.users)
+    });
 
-    currentRoomId = cleanRoom;
-    const room = getOrCreateRoom(cleanRoom);
-    const user = {
-      id: socket.id,
-      name: sanitizeDisplayName(displayName)
-    };
-
-    room.users.set(socket.id, user);
-    socket.join(cleanRoom);
-
-    // Send exact live state including recalculated position
-    socket.emit('room-state', serializeRoomState(room));
-    io.to(cleanRoom).emit('users-updated', Array.from(room.users.values()));
+    io.to(roomId).emit('users-update', Object.values(room.users));
+    io.to(roomId).emit('chat-message', {
+      system: true,
+      text: `${room.users[socket.id]} joined the room.`
+    });
   });
 
-  socket.on('play-track', ({ track }) => {
-    if (!currentRoomId || !rooms.has(currentRoomId)) return;
-    if (!track || !isValidVideoId(track.videoId)) return;
-
-    const room = rooms.get(currentRoomId);
-    room.currentTrack = buildTrackPayload(track);
+  socket.on('play-track', ({ roomId, track }) => {
+    const room = getOrCreateRoom(roomId);
+    room.currentTrack = track;
     room.isPlaying = true;
     room.position = 0;
     room.lastUpdated = Date.now();
-
-    io.to(room.id).emit('room-state', serializeRoomState(room));
+    io.to(roomId).emit('track-changed', { track, isPlaying: true, position: 0 });
   });
 
-  socket.on('add-to-queue', ({ track }) => {
-    if (!currentRoomId || !rooms.has(currentRoomId)) return;
-    if (!track || !isValidVideoId(track.videoId)) return;
-
-    const room = rooms.get(currentRoomId);
-    const payload = buildTrackPayload(track);
-
+  socket.on('add-to-queue', ({ roomId, track }) => {
+    const room = getOrCreateRoom(roomId);
     if (!room.currentTrack) {
-      room.currentTrack = payload;
+      room.currentTrack = track;
       room.isPlaying = true;
       room.position = 0;
       room.lastUpdated = Date.now();
+      io.to(roomId).emit('track-changed', { track, isPlaying: true, position: 0 });
     } else {
-      if (room.queue.length < 100) {
-        room.queue.push(payload);
-      }
+      room.queue.push(track);
+      io.to(roomId).emit('queue-updated', room.queue);
     }
-
-    io.to(room.id).emit('room-state', serializeRoomState(room));
   });
 
-  socket.on('remove-from-queue', ({ instanceId }) => {
-    if (!currentRoomId || !rooms.has(currentRoomId)) return;
-    const room = rooms.get(currentRoomId);
-    room.queue = room.queue.filter((item) => item.instanceId !== instanceId);
-    io.to(room.id).emit('room-state', serializeRoomState(room));
-  });
-
-  socket.on('next-track', (payload = {}) => {
-    if (!currentRoomId || !rooms.has(currentRoomId)) return;
-    const room = rooms.get(currentRoomId);
-    if (!room.currentTrack) return;
-
-    // Deduplicate simultaneous "ended" triggers from multiple clients
-    if (
-      payload &&
-      payload.expectedInstanceId &&
-      room.currentTrack.instanceId !== payload.expectedInstanceId
-    ) {
-      return;
-    }
-
-    advanceQueue(room);
-  });
-
-  socket.on('sync-action', ({ action, position }) => {
-    if (!currentRoomId || !rooms.has(currentRoomId)) return;
-    const room = rooms.get(currentRoomId);
-    if (!room.currentTrack) return;
-
-    const now = Date.now();
-    const livePos = getLivePosition(room);
-
-    if (action === 'play') {
-      room.position = typeof position === 'number' && position >= 0 ? position : livePos;
+  socket.on('next-track', ({ roomId }) => {
+    const room = getOrCreateRoom(roomId);
+    if (room.queue.length > 0) {
+      const next = room.queue.shift();
+      room.currentTrack = next;
       room.isPlaying = true;
-      room.lastUpdated = now;
-    } else if (action === 'pause') {
-      room.position = typeof position === 'number' && position >= 0 ? position : livePos;
-      room.isPlaying = false;
-      room.lastUpdated = now;
-    } else if (action === 'seek') {
-      const targetPos = Math.max(0, Number(position) || 0);
-      room.position = room.currentTrack.seconds > 0
-        ? Math.min(targetPos, room.currentTrack.seconds)
-        : targetPos;
-      room.lastUpdated = now;
-    } else {
-      return;
+      room.position = 0;
+      room.lastUpdated = Date.now();
+      io.to(roomId).emit('queue-updated', room.queue);
+      io.to(roomId).emit('track-changed', { track: next, isPlaying: true, position: 0 });
     }
-
-    io.to(room.id).emit('sync-update', {
-      isPlaying: room.isPlaying,
-      position: getLivePosition(room),
-      serverTime: now,
-      action
-    });
   });
 
-  socket.on('heartbeat-sync', () => {
-    if (!currentRoomId || !rooms.has(currentRoomId)) return;
-    const room = rooms.get(currentRoomId);
-    socket.emit('heartbeat-sync', {
-      currentTrack: room.currentTrack,
-      isPlaying: room.isPlaying,
-      position: getLivePosition(room),
-      serverTime: Date.now()
-    });
+  socket.on('sync-action', ({ roomId, action, position }) => {
+    const room = getOrCreateRoom(roomId);
+    room.position = position;
+    room.lastUpdated = Date.now();
+    room.isPlaying = action === 'play';
+    socket.to(roomId).emit('sync-update', { action, position });
   });
 
-  socket.on('send-chat', ({ text }) => {
-    if (!currentRoomId || !rooms.has(currentRoomId)) return;
-    const room = rooms.get(currentRoomId);
-    const user = room.users.get(socket.id);
-    const cleanText = String(text || '').trim().slice(0, 500);
-    if (!cleanText || !user) return;
-
-    const message = {
-      id: crypto.randomUUID(),
-      userId: socket.id,
-      sender: user.name,
-      text: cleanText,
-      timestamp: Date.now()
+  socket.on('send-chat', ({ roomId, text }) => {
+    const room = getOrCreateRoom(roomId);
+    const msg = {
+      user: room.users[socket.id] || 'Guest',
+      text,
+      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     };
-
-    room.messages.push(message);
-    if (room.messages.length > 100) {
-      room.messages.shift();
-    }
-
-    io.to(room.id).emit('chat-message', message);
+    room.messages.push(msg);
+    if (room.messages.length > 100) room.messages.shift();
+    io.to(roomId).emit('chat-message', msg);
   });
 
   socket.on('disconnect', () => {
-    if (currentRoomId && rooms.has(currentRoomId)) {
-      const room = rooms.get(currentRoomId);
-      room.users.delete(socket.id);
-      io.to(currentRoomId).emit('users-updated', Array.from(room.users.values()));
-
-      if (room.users.size === 0 && !room.isPlaying && room.queue.length === 0) {
-        rooms.delete(currentRoomId);
+    if (currentRoomId && rooms[currentRoomId]) {
+      const room = rooms[currentRoomId];
+      const name = room.users[socket.id];
+      delete room.users[socket.id];
+      io.to(currentRoomId).emit('users-update', Object.values(room.users));
+      if (name) {
+        io.to(currentRoomId).emit('chat-message', {
+          system: true,
+          text: `${name} left the room.`
+        });
       }
     }
   });
 });
 
-// Server-side 5-second heartbeat loop to keep all clients within tight sync
-setInterval(() => {
-  const now = Date.now();
-  for (const [roomId, room] of rooms.entries()) {
-    if (room.users.size === 0) continue;
-
-    if (room.currentTrack) {
-      const livePos = getLivePosition(room);
-      if (
-        room.isPlaying &&
-        room.currentTrack.seconds > 0 &&
-        livePos >= room.currentTrack.seconds + 1.5
-      ) {
-        advanceQueue(room);
-        continue;
-      }
-
-      io.to(roomId).emit('heartbeat-sync', {
-        currentTrack: room.currentTrack,
-        isPlaying: room.isPlaying,
-        position: livePos,
-        serverTime: now
-      });
-    }
-  }
-}, HEARTBEAT_INTERVAL_MS);
-
-server.listen(PORT, () => {
-  console.log(`ListenTogether server running on http://localhost:${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`ListenTogether v2 running on port ${PORT}`));
