@@ -1,18 +1,18 @@
 {
   "name": "listentogether",
-  "version": "1.0.0",
-  "description": "Real-time synchronized YouTube Music streaming PWA with live chat",
+  "version": "2.0.0",
+  "description": "Metrolist-inspired ListenTogether PWA with InnerTube",
   "main": "server.js",
-  "engines": {
-    "node": ">=20.0.0"
-  },
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.21.2",
-    "socket.io": "^4.8.1",
-    "yt-search": "^2.12.1"
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5",
+    "youtubei.js": "^10.5.0"
   }
 }
